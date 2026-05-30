@@ -5,7 +5,6 @@ import uuid
 import hashlib
 import base64
 from datetime import datetime, timezone
-import psycopg
 from dotenv import load_dotenv
 from mailjet_rest import Client
 
@@ -15,7 +14,6 @@ load_dotenv()
 app = Flask(__name__)
 
 # ---------------- Config ----------------
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:joetel88@localhost:5432/Gift_card_verifier")
 MAILJET_API_KEY = os.getenv("MAILJET_API_KEY")
 MAILJET_SECRET_KEY = os.getenv("MAILJET_SECRET_KEY")
 MAILJET_FROM_EMAIL = os.getenv("MAILJET_FROM_EMAIL", "giftsafer@gmail.com")
@@ -32,52 +30,6 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def get_db():
-    """
-    Creates a new DB connection per call.
-    For small apps this is fine. For bigger apps, consider a pool.
-    """
-    # Fail fast on unreachable DB to avoid Gunicorn worker timeouts.
-    return psycopg.connect(DATABASE_URL, connect_timeout=5)
-
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-
-    # used_codes table
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS used_codes (
-            id SERIAL PRIMARY KEY,
-            card_type TEXT NOT NULL,
-            code TEXT NOT NULL UNIQUE,
-            used_at TEXT NOT NULL,
-            reference TEXT NOT NULL
-        );
-        """
-    )
-
-    # check_logs table
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS check_logs (
-            id SERIAL PRIMARY KEY,
-            ip TEXT NOT NULL,
-            card_type TEXT NOT NULL,
-            code_masked TEXT NOT NULL,
-            status TEXT NOT NULL,
-            checked_at TEXT NOT NULL,
-            reference TEXT NOT NULL
-        );
-        """
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 def rate_limited(ip: str) -> bool:
     t = time.time()
     hits = _ip_hits.get(ip, [])
@@ -88,13 +40,6 @@ def rate_limited(ip: str) -> bool:
     hits.append(t)
     _ip_hits[ip] = hits
     return False
-
-
-def mask_code(code: str) -> str:
-    code = (code or "").strip()
-    if len(code) <= 4:
-        return "*" * len(code)
-    return "*" * (len(code) - 4) + code[-4:]
 
 
 def matches_demo_format(card_type: str, code: str) -> bool:
@@ -127,48 +72,6 @@ def demo_decision(card_type: str, code: str) -> str:
     return "invalid"
 
 
-def is_used(code: str) -> bool:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM used_codes WHERE code = %s LIMIT 1", (code,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row is not None
-
-
-def mark_used(card_type: str, code: str, reference: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO used_codes (card_type, code, used_at, reference)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (code) DO NOTHING;
-        """,
-        (card_type, code, now_iso(), reference),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def log_check(ip: str, card_type: str, code: str, status: str, reference: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO check_logs (ip, card_type, code_masked, status, checked_at, reference)
-        VALUES (%s, %s, %s, %s, %s, %s);
-        """,
-        (ip, card_type, mask_code(code), status, now_iso(), reference),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-
 mailjet = Client(
     auth=(MAILJET_API_KEY, MAILJET_SECRET_KEY),
     version="v3.1"
@@ -194,7 +97,6 @@ def send_email(subject: str, body: str, attachments=None):
     if attachments:
         message["Attachments"] = []
         for a in attachments:
-            # a["data"] must be raw bytes
             b64 = base64.b64encode(a["data"]).decode("utf-8")
             message["Attachments"].append(
                 {
@@ -208,7 +110,6 @@ def send_email(subject: str, body: str, attachments=None):
 
     result = mailjet.send.create(data=data)
 
-    # Always inspect the JSON response for the real reason
     try:
         payload = result.json()
     except Exception:
@@ -217,7 +118,6 @@ def send_email(subject: str, body: str, attachments=None):
     if result.status_code != 200:
         raise RuntimeError(f"Mailjet HTTP {result.status_code}: {payload}")
 
-    # Even with 200, Mailjet can report per-message failure
     msg0 = (payload.get("Messages") or [{}])[0]
     if msg0.get("Status") != "success":
         raise RuntimeError(f"Mailjet message failed: {msg0}")
@@ -234,9 +134,6 @@ def parse_data_url(data_url: str):
         raise ValueError("Invalid mime type.")
     maintype, subtype = mime.split("/", 1)
     return maintype, subtype, base64.b64decode(encoded)
-
-
-init_db()
 
 
 @app.route("/")
@@ -332,12 +229,10 @@ def api_check():
     reference = uuid.uuid4().hex[:10].upper()
 
     if rate_limited(ip):
-        status = "rate_limited"
-        log_check(ip, card_type, code, status, reference)
         return jsonify(
             {
                 "ok": False,
-                "status": status,
+                "status": "rate_limited",
                 "label": "Too many requests",
                 "message": f"Rate limit: max {MAX_REQUESTS} checks per {WINDOW_SECONDS}s.",
                 "reference": reference,
@@ -346,12 +241,10 @@ def api_check():
         ), 429
 
     if card_type not in ("DemoCard", "SampleTunes", "MockFlix"):
-        status = "invalid"
-        log_check(ip, card_type, code, status, reference)
         return jsonify(
             {
                 "ok": False,
-                "status": status,
+                "status": "invalid",
                 "label": "Invalid",
                 "message": "Choose a valid card type.",
                 "reference": reference,
@@ -360,12 +253,10 @@ def api_check():
         ), 400
 
     if not code:
-        status = "invalid"
-        log_check(ip, card_type, code, status, reference)
         return jsonify(
             {
                 "ok": False,
-                "status": status,
+                "status": "invalid",
                 "label": "Invalid",
                 "message": "Enter a code.",
                 "reference": reference,
@@ -374,12 +265,10 @@ def api_check():
         ), 400
 
     if not matches_demo_format(card_type, code):
-        status = "invalid"
-        log_check(ip, card_type, code, status, reference)
         return jsonify(
             {
                 "ok": True,
-                "status": status,
+                "status": "invalid",
                 "label": "Invalid",
                 "message": "Code format not recognized for this card type.",
                 "reference": reference,
@@ -387,28 +276,10 @@ def api_check():
             }
         )
 
-    if is_used(code):
-        status = "used"
-        log_check(ip, card_type, code, status, reference)
-        return jsonify(
-            {
-                "ok": True,
-                "status": status,
-                "label": "Used",
-                "message": "This code has already been checked and marked as used.",
-                "reference": reference,
-                "checked_at": now_iso(),
-            }
-        )
-
-
     status = demo_decision(card_type, code)
 
     if status == "valid":
         balance = stable_demo_balance(code)
-        currency = "NGN"
-        mark_used(card_type, code, reference)
-        log_check(ip, card_type, code, status, reference)
         return jsonify(
             {
                 "ok": True,
@@ -417,13 +288,12 @@ def api_check():
                 "message": "Verification completed.",
                 "card_type": card_type,
                 "balance": balance,
-                "currency": currency,
+                "currency": "NGN",
                 "reference": reference,
                 "checked_at": now_iso(),
             }
         )
 
-    log_check(ip, card_type, code, status, reference)
     return jsonify(
         {
             "ok": True,
@@ -434,9 +304,6 @@ def api_check():
             "checked_at": now_iso(),
         }
     )
-
-
-
 
 
 if __name__ == "__main__":
